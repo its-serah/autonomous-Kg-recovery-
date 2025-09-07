@@ -242,22 +242,10 @@ For questions or collaborations, please reach out:
 - Open source contributors to NumPy, Matplotlib, and Python ecosystem
 - Data quality and information extraction research initiatives
 
-## Citation
-
-If you use this work in your research, please cite:
-
-```bibtex
-@misc{kg-quality-improvement-2024,
-  title={Knowledge Graph Quality Improvement: A Reinforcement Learning Approach},
-  author={[Your Name]},
-  year={2024},
-  url={[Repository URL]}
-}
-```
 
 ---
 
 **Keywords**: Knowledge Graphs, Reinforcement Learning, Data Quality, Graph Neural Networks, Information Extraction, Q-learning, Adaptive Systems
 >>>>>>> 970a790 (Complete Knowledge Graph Quality Improvement system with RL-based adaptive cleaning)
 
-*Last updated: September 2024*
+*Last updated: September 2025*
