@@ -45,7 +45,7 @@ Our system implements six cleaning strategies for different types of KG quality 
                                 ▼
                        ┌──────────────────┐
                        │  Reward Signal   │
-                       │ • Performance Δ  │
+                       │ • Performance    │
                        │ • Error Reduction│
                        │ • Efficiency     │
                        └──────────────────┘
