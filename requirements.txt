@@ -1,0 +1,14 @@
+numpy>=1.21.0
+matplotlib>=3.5.0
+logging
+pathlib
+collections
+json
+random
+time
+dataclasses
+typing
+abc
+statistics
+pickle
+enum
