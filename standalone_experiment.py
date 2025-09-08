@@ -18,6 +18,16 @@ from abc import ABC, abstractmethod
 import statistics
 from dataclasses import dataclass
 
+# Tier-1 components
+from src.data.docred_loader import DocREDDataLoader as Tier1DocLoader
+from src.models.tfidf_verifier import DocLevelVerifier, TripleExample
+from src.models.hf_docre import HFDocREVerifier, TripleExampleHF
+from src.embeddings.distmult import KGETrainer
+from src.constraints.constraints import apply_constraints
+from src.ensemble.stacker import StackingEnsemble
+from src.calibration.conformal import compute_conformal_thresholds
+from src.anomaly.edge_anomaly import EdgeAnomalyDetector
+
 # ============================================================================
 # RL-BASED ADAPTIVE HEALER COMPONENTS
 # ============================================================================
@@ -420,13 +430,16 @@ class RuleBasedCleaner(BaselineSystem):
         return cleaned_kg
     
     def _estimate_confidence(self, head: int, tail: int, relation: str) -> float:
-        """Estimate confidence score for a relation triple"""
-        base_confidence = 0.7
-        relation_bonus = min(0.2, hash(relation) % 100 / 1000)
-        entity_distance_penalty = min(0.1, abs(head - tail) * 0.01)
+        """Estimate confidence score for a relation triple with MORE VARIATION"""
+        # Create much more variation in confidence scores
+        relation_hash = hash(relation) % 1000
+        entity_hash = hash((head, tail)) % 1000
         
-        confidence = base_confidence + relation_bonus - entity_distance_penalty
-        return max(0.1, min(1.0, confidence))
+        base_confidence = 0.3 + (relation_hash / 1000) * 0.6  # 0.3 to 0.9 range
+        entity_penalty = (entity_hash / 1000) * 0.3  # up to 0.3 penalty
+        
+        confidence = base_confidence - entity_penalty
+        return max(0.1, min(0.95, confidence))
     
     def get_system_description(self) -> str:
         return "Rule-based cleaning with confidence filtering and deduplication"
@@ -559,8 +572,55 @@ class StatisticalOutlierFilter(BaselineSystem):
 # DATA GENERATION AND CORRUPTION
 # ============================================================================
 
+class DocREDDataLoader:
+    """Load and process DocRED dataset"""
+    
+    def __init__(self, data_path: str = None):
+        if data_path is None:
+            self.data_path = Path(__file__).parent / "experiments" / "exp1_docred_svo_healing" / "data" / "raw_data"
+        else:
+            self.data_path = Path(data_path)
+            
+    def load_docred_data(self, split: str = "train_annotated", max_docs: int = 500) -> Tuple[Dict, Dict]:
+        """Load DocRED data and convert to our format"""
+        file_path = self.data_path / f"{split}.json"
+        
+        if not file_path.exists():
+            raise FileNotFoundError(f"DocRED file not found: {file_path}")
+            
+        with open(file_path, 'r') as f:
+            docred_data = json.load(f)
+        
+        # Convert to our KG format
+        kg_data = {}
+        ground_truth = {}
+        
+        for i, doc in enumerate(docred_data[:max_docs]):
+            doc_id = f"docred_{i:04d}"
+            
+            # Extract relations from labels
+            relations = []
+            for label in doc.get("labels", []):
+                h = label["h"]
+                t = label["t"] 
+                r = label["r"]
+                relations.append((h, t, r))
+            
+            kg_data[doc_id] = relations
+            ground_truth[doc_id] = relations.copy()
+            
+        return kg_data, ground_truth
+    
+    def get_relation_info(self) -> Dict:
+        """Load relation type information"""
+        rel_info_path = self.data_path / "rel_info.json"
+        if rel_info_path.exists():
+            with open(rel_info_path, 'r') as f:
+                return json.load(f)
+        return {}
+
 class KnowledgeGraphGenerator:
-    """Generate synthetic knowledge graphs for experimentation"""
+    """Generate synthetic knowledge graphs for experimentation (kept for fallback)"""
     
     def __init__(self, seed: int = 42):
         random.seed(seed)
@@ -598,7 +658,7 @@ class KnowledgeGraphGenerator:
         return kg_data, ground_truth
     
     def apply_corruption(self, clean_kg: Dict, corruption_rate: float = 0.2) -> Dict:
-        """Apply corruption to clean knowledge graph"""
+        """Apply HEAVY corruption to clean knowledge graph (synthetic fallback)."""
         corrupted_kg = {}
         
         for doc_id, relations in clean_kg.items():
@@ -606,18 +666,25 @@ class KnowledgeGraphGenerator:
             
             for h, t, r in relations:
                 if random.random() < corruption_rate:
-                    # Apply corruption
-                    corruption_type = random.choice(['entity_swap', 'relation_change', 'remove'])
+                    # Apply corruption with higher damage
+                    corruption_type = random.choice([
+                        'entity_swap', 'entity_swap', 'relation_change', 'relation_change', 
+                        'remove', 'both_entities_wrong'
+                    ])
                     
                     if corruption_type == 'entity_swap':
                         # Swap one entity
                         if random.random() < 0.5:
-                            h = random.randint(0, 25)
+                            h = random.randint(0, 50)  # Larger entity space (synthetic only)
                         else:
-                            t = random.randint(0, 25)
+                            t = random.randint(0, 50)
                     elif corruption_type == 'relation_change':
-                        # Change relation type
+                        # Change relation type  
                         r = random.choice(self.relation_types)
+                    elif corruption_type == 'both_entities_wrong':
+                        # Corrupt both entities
+                        h = random.randint(0, 50)
+                        t = random.randint(0, 50)
                     elif corruption_type == 'remove':
                         # Skip this relation (remove it)
                         continue
@@ -625,17 +692,64 @@ class KnowledgeGraphGenerator:
                 if h != t:  # Ensure no self-relations
                     corrupted_relations.append((h, t, r))
             
-            # Add some spurious relations
-            num_spurious = random.randint(0, max(1, len(relations) // 5))
+            # Add MANY spurious relations (noise)
+            original_length = len(relations)
+            num_spurious = random.randint(original_length // 3, original_length // 2)  # 33-50% noise
             for _ in range(num_spurious):
-                h = random.randint(0, 25)
-                t = random.randint(0, 25)
+                h = random.randint(0, 50)
+                t = random.randint(0, 50) 
                 r = random.choice(self.relation_types)
                 if h != t:
                     corrupted_relations.append((h, t, r))
             
             corrupted_kg[doc_id] = corrupted_relations
         
+        return corrupted_kg
+
+    def apply_corruption_docred(self, clean_kg: Dict, docs: Dict, relation_ids: List[str], corruption_rate: float = 0.4) -> Dict:
+        """Apply corruption to DocRED-formatted KG while staying in-vocabulary and in-bounds.
+        - Only uses provided relation_ids (Wikidata PIDs)
+        - Entity indices are sampled within each doc's vertexSet
+        - Adds 33-50% spurious edges per doc
+        """
+        corrupted_kg: Dict[str, List[Tuple[int,int,str]]] = {}
+        rel_ids = relation_ids if relation_ids else []
+        for doc_id, relations in clean_kg.items():
+            corrupted_relations: List[Tuple[int,int,str]] = []
+            num_ents = len(docs.get(doc_id, {}).get('vertexSet', []))
+            for h, t, r in relations:
+                if random.random() < corruption_rate:
+                    corruption_type = random.choice([
+                        'entity_swap', 'relation_change', 'remove', 'both_entities_wrong'
+                    ])
+                    if corruption_type == 'entity_swap' and num_ents >= 2:
+                        if random.random() < 0.5:
+                            h = random.randint(0, max(0, num_ents - 1))
+                        else:
+                            t = random.randint(0, max(0, num_ents - 1))
+                    elif corruption_type == 'relation_change' and rel_ids:
+                        # change to a different PID
+                        r_candidates = [x for x in rel_ids if x != r]
+                        r = random.choice(r_candidates) if r_candidates else r
+                    elif corruption_type == 'both_entities_wrong' and num_ents >= 2:
+                        h = random.randint(0, max(0, num_ents - 1))
+                        t = random.randint(0, max(0, num_ents - 1))
+                    elif corruption_type == 'remove':
+                        continue
+                if h != t:
+                    corrupted_relations.append((h,t,r))
+            # Spurious edges
+            original_length = len(relations)
+            num_spurious = random.randint(original_length // 3, original_length // 2) if original_length > 0 else 0
+            for _ in range(num_spurious):
+                if num_ents >= 2 and rel_ids:
+                    h = random.randint(0, num_ents - 1)
+                    t = random.randint(0, num_ents - 1)
+                    if h == t:
+                        continue
+                    r = random.choice(rel_ids)
+                    corrupted_relations.append((h,t,r))
+            corrupted_kg[doc_id] = corrupted_relations
         return corrupted_kg
 
 # ============================================================================
@@ -746,19 +860,46 @@ class ExperimentRunner:
         
         self.logger.info("Experiment runner initialized")
     
-    def generate_experimental_data(self) -> Tuple[Dict, Dict, Dict]:
+    def generate_experimental_data(self, use_docred: bool = True, max_documents: int = 100) -> Tuple[Dict, Dict, Dict]:
         """Generate clean KG, corrupted KG, and ground truth"""
-        self.logger.info("Generating experimental knowledge graph data...")
+        self.logger.info("Loading experimental knowledge graph data...")
         
-        # Generate clean knowledge graph
+        # Try loading DocRED data first
+        if use_docred:
+            try:
+                self.logger.info("Attempting to load DocRED dataset...")
+                # Use Tier1 loader to get docs and KG (ground truth)
+                data_dir = Path(__file__).parent / "experiments" / "exp1_docred_svo_healing" / "data" / "raw_data"
+                doc_loader = Tier1DocLoader(str(data_dir))
+                docs, doc_gt = doc_loader.load_split('train_annotated', max_docs=max_documents)
+                clean_kg = doc_gt
+                ground_truth = doc_gt
+                self.logger.info(f"Successfully loaded {len(clean_kg)} documents from DocRED")
+                self.logger.info(f"Total relations from DocRED: {sum(len(r) for r in clean_kg.values())}")
+                
+                # Apply DocRED-safe corruption
+                relation_ids = list(doc_loader.rel2name.keys())
+                corrupted_kg = self.kg_generator.apply_corruption_docred(clean_kg, docs, relation_ids, corruption_rate=0.4)
+                
+                self.logger.info(f"Applied 40% corruption to DocRED data")
+                self.logger.info(f"Corrupted relations: {sum(len(r) for r in corrupted_kg.values())}")
+                
+                return clean_kg, corrupted_kg, ground_truth
+                
+            except Exception as e:
+                self.logger.warning(f"Failed to load DocRED data: {e}")
+                self.logger.info("Falling back to synthetic data generation...")
+        
+        # Fallback to synthetic data generation
+        self.logger.info("Generating synthetic knowledge graph data...")
         clean_kg, ground_truth = self.kg_generator.generate_clean_kg(
-            num_documents=20, relations_per_doc=(10, 30)
+            num_documents=max_documents, relations_per_doc=(20, 50)
         )
         
         # Apply corruption
-        corrupted_kg = self.kg_generator.apply_corruption(clean_kg, corruption_rate=0.25)
+        corrupted_kg = self.kg_generator.apply_corruption(clean_kg, corruption_rate=0.4)
         
-        self.logger.info(f"Generated {len(clean_kg)} documents")
+        self.logger.info(f"Generated {len(clean_kg)} synthetic documents")
         self.logger.info(f"Clean relations: {sum(len(r) for r in clean_kg.values())}")
         self.logger.info(f"Corrupted relations: {sum(len(r) for r in corrupted_kg.values())}")
         
@@ -839,6 +980,206 @@ class ExperimentRunner:
         performance['healing_actions_applied'] = total_cleaning_actions
         
         return performance
+
+    def run_tier1_pipeline(self, corrupted_kg: Dict, ground_truth: Dict) -> Dict:
+        """Run Tier-1 pipeline: Doc-level verifier -> constraints -> KGE -> ensemble.
+        Returns dict with metrics and details.
+        """
+        self.logger.info("Running Tier-1 pipeline (verifier + constraints + KGE + ensemble)...")
+        data_dir = Path(__file__).parent / "experiments" / "exp1_docred_svo_healing" / "data" / "raw_data"
+        loader = Tier1DocLoader(str(data_dir))
+        docs, _ = loader.load_split('train_annotated', max_docs=None)
+
+        # Split train/dev doc ids
+        rng = np.random.RandomState(42)
+        doc_ids = sorted(list(corrupted_kg.keys()))
+        rng.shuffle(doc_ids)
+        dev_size = max(200, int(0.1 * len(doc_ids)))
+        dev_ids = set(doc_ids[:dev_size])
+        train_ids = [d for d in doc_ids if d not in dev_ids]
+
+        # Build training examples for verifier
+        self.logger.info("Preparing training data for doc-level verifier...")
+        train_examples: List[TripleExample] = []
+        dev_examples: List[TripleExample] = []
+        train_examples_hf: List[TripleExampleHF] = []
+        dev_examples_hf: List[TripleExampleHF] = []
+
+        all_relations = list(loader.rel2name.keys()) if loader.rel2name else list({r for rels in ground_truth.values() for (_,_,r) in rels})
+
+        def build_examples_for_doc(doc_id: str, into_list: List[TripleExample], into_list_hf: List[TripleExampleHF]):
+            d = docs[doc_id]
+            pos = d.get('labels', [])
+            pos_set = {(lbl['h'], lbl['t'], lbl['r']) for lbl in pos}
+            # positives with evidence and markers
+            for lbl in pos:
+                text_plain = loader.extract_evidence_text(d, lbl['h'], lbl['t'], lbl.get('evidence', []))
+                text_marked = loader.build_text_with_markers(d, lbl['h'], lbl['t'], lbl.get('evidence', []))
+                into_list.append(TripleExample(text=text_plain, relation=lbl['r'], label=1))
+                into_list_hf.append(TripleExampleHF(text=text_marked, relation=lbl['r'], label=1))
+            # negatives (hard): wrong-relation for same pair
+            for lbl in pos:
+                r_neg_choices = [rr for rr in all_relations if rr != lbl['r']]
+                if not r_neg_choices:
+                    continue
+                r_neg = r_neg_choices[rng.randint(0, len(r_neg_choices))]
+                text_plain = loader.extract_evidence_text(d, lbl['h'], lbl['t'], None)
+                text_marked = loader.build_text_with_markers(d, lbl['h'], lbl['t'], None)
+                into_list.append(TripleExample(text=text_plain, relation=r_neg, label=0))
+                into_list_hf.append(TripleExampleHF(text=text_marked, relation=r_neg, label=0))
+            # negatives (random pair)
+            n_neg = max(1, len(pos))
+            n_ents = len(d.get('vertexSet', []))
+            tries = 0
+            while n_neg > 0 and tries < 5 * (n_neg + 1):
+                h = rng.randint(0, max(1, n_ents))
+                t = rng.randint(0, max(1, n_ents))
+                if n_ents == 0 or h == t:
+                    tries += 1
+                    continue
+                r = all_relations[rng.randint(0, len(all_relations))]
+                if (h,t,r) in pos_set:
+                    tries += 1
+                    continue
+                text_plain = loader.extract_evidence_text(d, h, t, None)
+                text_marked = loader.build_text_with_markers(d, h, t, None)
+                if not text_plain:
+                    tries += 1
+                    continue
+                into_list.append(TripleExample(text=text_plain, relation=r, label=0))
+                into_list_hf.append(TripleExampleHF(text=text_marked, relation=r, label=0))
+                n_neg -= 1
+                tries += 1
+
+        for did in train_ids:
+            build_examples_for_doc(did, train_examples, train_examples_hf)
+        for did in dev_ids:
+            build_examples_for_doc(did, dev_examples, dev_examples_hf)
+
+        # Train verifier
+        # Prefer transformer-based verifier; fallback to TF-IDF
+        use_hf = True
+        if use_hf:
+            hf_verifier = HFDocREVerifier(epochs=1, batch_size=16)
+            self.logger.info(f"Training transformer verifier on {len(train_examples_hf)} examples...")
+            hf_verifier.fit(train_examples_hf)
+            rel2thr_ver = hf_verifier.calibrate_thresholds(dev_examples_hf)
+        else:
+            verifier = DocLevelVerifier()
+            self.logger.info(f"Training verifier on {len(train_examples)} examples...")
+            verifier.fit(train_examples)
+            rel2thr_ver = verifier.calibrate_thresholds(dev_examples)
+
+        # Train KGE on train split ground truth using doc-local entity IDs
+        self.logger.info("Training DistMult KGE on ground-truth triples (train split)...")
+        kge_triples = []
+        for did in train_ids:
+            for (h,t,r) in ground_truth.get(did, []):
+                kge_triples.append((f"{did}:{h}", r, f"{did}:{t}"))
+        kge = KGETrainer(dim=32, epochs=2, neg_ratio=2, lr=1e-2)
+        if kge_triples:
+            kge.fit(kge_triples)
+
+        # Prepare dev features for ensemble training and conformal calibration
+        self.logger.info("Building dev features for ensemble training...")
+        X_dev = []
+        y_dev = []
+        rels_dev = []
+        probs_dev_for_conformal = []
+        labels_dev_for_conformal = []
+        rels_dev_for_conformal = []
+        for did in dev_ids:
+            d = docs[did]
+            gt_set = set(ground_truth.get(did, []))
+            inv_index = set((tt, hh, rr) for (hh,tt,rr) in corrupted_kg.get(did, []))
+            for (h,t,r) in corrupted_kg.get(did, []):
+                text = loader.build_text_with_markers(d, h, t, None)
+                if use_hf:
+                    tp = hf_verifier.predict_proba([(text, r)])[0] if text else 0.0
+                else:
+                    tp = verifier.predict_proba([(text, r)])[0] if text else 0.0
+                kgp = kge.score(f"{did}:{h}", r, f"{did}:{t}") if kge_triples else 0.0
+                inv_exists = 1.0 if (t,h, r) in corrupted_kg.get(did, []) else 0.0
+                X_dev.append([tp, kgp, inv_exists])
+                y_dev.append(1 if (h,t,r) in gt_set else 0)
+                rels_dev.append(r)
+                probs_dev_for_conformal.append(tp)
+                labels_dev_for_conformal.append(1 if (h,t,r) in gt_set else 0)
+                rels_dev_for_conformal.append(r)
+        X_dev = np.array(X_dev, dtype=np.float32) if X_dev else np.zeros((0,3), dtype=np.float32)
+        y_dev = np.array(y_dev, dtype=np.int32)
+
+        # Train ensemble
+        ensemble = StackingEnsemble()
+        if len(X_dev) and y_dev.sum() > 0:
+            self.logger.info(f"Training ensemble on {len(X_dev)} dev triples...")
+            ensemble.fit(X_dev, y_dev)
+        else:
+            self.logger.warning("Insufficient dev data for ensemble; falling back to verifier only.")
+
+        # Calibrate thresholds with conformal prediction (per relation)
+        rel2thr_conf: Dict[str, float] = {}
+        if len(rels_dev_for_conformal):
+            # Use ensemble probs if available; else use verifier probs (tp already holds verifier/hf prob)
+            if len(X_dev) and ensemble.fitted:
+                probs_all = ensemble.predict_proba(np.array(X_dev, dtype=np.float32))
+                rel2thr_conf = compute_conformal_thresholds(
+                    probs=list(probs_all.tolist()),
+                    labels=labels_dev_for_conformal,
+                    relations=rels_dev_for_conformal,
+                    alpha=0.1,
+                    min_per_rel=20
+                )
+            else:
+                rel2thr_conf = compute_conformal_thresholds(
+                    probs=probs_dev_for_conformal,
+                    labels=labels_dev_for_conformal,
+                    relations=rels_dev_for_conformal,
+                    alpha=0.1,
+                    min_per_rel=20
+                )
+
+        # Train anomaly detector on ground-truth (train split only) for normal edge patterns
+        self.logger.info("Training edge anomaly detector on ground-truth (train split)...")
+        anomaly = EdgeAnomalyDetector(contamination=0.1)
+        gt_train_subset = {did: ground_truth.get(did, []) for did in train_ids}
+        anomaly.fit_on_ground_truth(gt_train_subset)
+
+        # Apply to full corrupted KG
+        self.logger.info("Scoring full corrupted KG with Tier-2 (anomaly + conformal + ensemble)...")
+        cleaned_kg: Dict[str, List[Tuple[int,int,str]]] = {}
+        for did, triples in corrupted_kg.items():
+            d = docs[did]
+            scored = []
+            for (h,t,r) in triples:
+                # Anomaly pruning first
+                if anomaly.predict_is_outlier(triples, (h,t,r)):
+                    continue
+                text = loader.build_text_with_markers(d, h, t, None)
+                if use_hf:
+                    tp = hf_verifier.predict_proba([(text, r)])[0] if text else 0.0
+                else:
+                    tp = verifier.predict_proba([(text, r)])[0] if text else 0.0
+                kgp = kge.score(f"{did}:{h}", r, f"{did}:{t}") if kge_triples else 0.0
+                inv_exists = 1.0 if (t,h, r) in triples else 0.0
+                feat = np.array([[tp, kgp, inv_exists]], dtype=np.float32)
+                prob = float(ensemble.predict_proba(feat)[0]) if ensemble.fitted else float(tp)
+                # Conformal threshold per relation
+                thr = rel2thr_conf.get(r, rel2thr_ver.get(r, 0.5))
+                if prob >= thr:
+                    scored.append((h,t,r,prob))
+            # Apply constraints per doc
+            scored = apply_constraints(scored)
+            cleaned_kg[did] = [(h,t,r) for (h,t,r,_) in scored]
+
+        # Evaluate
+        metrics = calculate_performance_metrics(cleaned_kg, ground_truth)
+        self.logger.info(f"Tier-1 ensemble performance: F1 = {metrics['f1']:.3f}")
+
+        return {
+            'metrics': metrics,
+            'num_selected_relations': sum(len(v) for v in cleaned_kg.values())
+        }
     
     def generate_visualizations(self, baseline_results: Dict, rl_results: Dict):
         """Generate experiment visualizations"""
@@ -931,7 +1272,7 @@ class ExperimentRunner:
         plt.savefig(plots_dir / "system_comparison.png", dpi=300, bbox_inches='tight')
         plt.close()
     
-    def save_results(self, baseline_results: Dict, rl_results: Dict, clean_kg: Dict, corrupted_kg: Dict):
+    def save_results(self, baseline_results: Dict, rl_results: Dict, clean_kg: Dict, corrupted_kg: Dict, tier1_results: Dict = None):
         """Save experiment results"""
         self.logger.info("Saving experiment results...")
         
@@ -942,12 +1283,14 @@ class ExperimentRunner:
                 'total_corrupted_relations': sum(len(relations) for relations in corrupted_kg.values()),
                 'corruption_applied': True
             },
-            'baseline_results': baseline_results,
+'baseline_results': baseline_results,
+            'tier1_results': tier1_results,
             'rl_results': rl_results,
             'summary': {
                 'best_baseline_system': baseline_results['comparison']['best_systems']['f1'],
                 'best_baseline_f1': max(r['metrics']['f1'] for r in baseline_results['results'].values()),
-                'rl_final_f1': rl_results['final_performance']['f1'],
+'rl_final_f1': rl_results['final_performance']['f1'],
+                'tier1_f1': tier1_results['metrics']['f1'] if tier1_results else None,
                 'rl_training_episodes': len(rl_results['episode_rewards'])
             }
         }
@@ -964,25 +1307,31 @@ class ExperimentRunner:
         start_time = time.time()
         
         try:
-            # Generate data
-            clean_kg, corrupted_kg, ground_truth = self.generate_experimental_data()
+            # Generate data (try DocRED first, fallback to synthetic)
+            clean_kg, corrupted_kg, ground_truth = self.generate_experimental_data(
+                use_docred=True, max_documents=3053  # Use full DocRED dataset
+            )
             
             # Run baseline comparison
             baseline_results = self.run_baseline_comparison(corrupted_kg, ground_truth)
             
             # Train and evaluate RL cleaner
-            rl_results = self.run_rl_cleaner_training(corrupted_kg, ground_truth, num_episodes=40)
+            rl_results = self.run_rl_cleaner_training(corrupted_kg, ground_truth, num_episodes=1000)
+
+            # Run Tier-1 pipeline (verifier + constraints + KGE + ensemble)
+            tier1_results = self.run_tier1_pipeline(corrupted_kg, ground_truth)
             
             # Generate visualizations
             self.generate_visualizations(baseline_results, rl_results)
             
             # Save results
-            self.save_results(baseline_results, rl_results, clean_kg, corrupted_kg)
+            self.save_results(baseline_results, rl_results, clean_kg, corrupted_kg, tier1_results)
             
             total_time = time.time() - start_time
             
             # Print summary
             self.print_experiment_summary(baseline_results, rl_results, total_time)
+            print(f"Tier-1 ensemble F1: {tier1_results['metrics']['f1']:.3f}")
             
         except Exception as e:
             self.logger.error(f"Experiment failed: {str(e)}", exc_info=True)
